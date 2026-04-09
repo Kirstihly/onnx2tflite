@@ -6,7 +6,7 @@ If you have some good ideas, welcome to discuss or give project PRs.
 ```cmd
 git clone https://github.com/MPolaris/onnx2tflite.git
 cd onnx2tflite
-python setup.py install
+pip install .
 ```
 ```python
 from onnx2tflite import onnx_converter

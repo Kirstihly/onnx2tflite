@@ -263,7 +263,18 @@ class TFTile():
 class TFUnsqueeze():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, node_outputs, layout_dict, *args, **kwargs)->None:
         super().__init__()
-        self.axis = node_attribute['axes'] if 'axes' in node_attribute else node_weights[node_inputs[1]]
+        if 'axes' in node_attribute:
+            self.axis = node_attribute['axes']
+        elif len(node_inputs) > 1 and node_inputs[1]:
+            self.axis = (
+                node_weights[node_inputs[1]]
+                if node_inputs[1] in node_weights
+                else tensor_grap[node_inputs[1]]
+            )
+        else:
+            raise ValueError(
+                "Unsqueeze needs axes as an attribute or a non-empty second input; check the ONNX model."
+            )
         if not isinstance(self.axis, int):
             self.axis = int(self.axis[0])
         input_shape = tensor_grap[node_inputs[0]].shape
@@ -283,16 +294,32 @@ class TFUnsqueeze():
 class TFSqueeze():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, node_outputs, layout_dict, *args, **kwargs)->None:
         super().__init__()
-        self.axis = node_attribute['axes'] if 'axes' in node_attribute else node_weights[node_inputs[1]]
-        if not isinstance(self.axis, int):
-            self.axis = int(self.axis[0])
+        # Opset >=11: axes may be an optional input; if omitted, squeeze all dims of size 1 (no attribute, single input).
+        if 'axes' in node_attribute:
+            self.axis = node_attribute['axes']
+            self.squeeze_all = False
+        elif len(node_inputs) > 1 and node_inputs[1]:
+            self.axis = (
+                node_weights[node_inputs[1]]
+                if node_inputs[1] in node_weights
+                else tensor_grap[node_inputs[1]]
+            )
+            self.squeeze_all = False
+        else:
+            self.squeeze_all = True
+            self.axis = None
+        if not self.squeeze_all:
+            if not isinstance(self.axis, int):
+                self.axis = int(self.axis[0])
         input_shape = tensor_grap[node_inputs[0]].shape
         if len(input_shape) <= 3:
             layout_dict[node_outputs[0]] = Layout.Channel_None
-        if len(input_shape) > 2 and layout_dict[node_inputs[0]] == Layout.Channel_Last:
+        if not self.squeeze_all and len(input_shape) > 2 and layout_dict[node_inputs[0]] == Layout.Channel_Last:
             self.axis = dimension_utils.channel_to_last_dimension(self.axis)
 
     def __call__(self, inputs):
+        if self.squeeze_all:
+            return tf.squeeze(inputs)
         return tf.squeeze(inputs, self.axis)
 
 @OPERATOR.register_operator("DepthToSpace")
