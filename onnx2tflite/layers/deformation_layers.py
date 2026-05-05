@@ -111,17 +111,17 @@ class TFSlice():
     def __call__(self, inputs):
         rank = inputs.shape.rank
         shape_t = tf.shape(inputs)
-        begin_vals = [tf.constant(0, tf.int32) for _ in range(rank)]
-        end_vals = [tf.cast(shape_t[i], tf.int32) for i in range(rank)]
-        stride_vals = [tf.constant(1, tf.int32) for _ in range(rank)]
+        begin_vals = [tf.constant(0, tf.int64) for _ in range(rank)]
+        end_vals = [tf.cast(shape_t[i], tf.int64) for i in range(rank)]
+        stride_vals = [tf.constant(1, tf.int64) for _ in range(rank)]
 
         for j, ax in enumerate(self.axes.tolist()):
             ax = int(ax)
             st_i = int(self.steps[j])
-            dim = tf.cast(shape_t[ax], tf.int32)
-            s_const = tf.constant(int(self.starts[j]), tf.int32)
-            e_const = tf.constant(int(self.ends[j]), tf.int32)
-            st_const = tf.constant(st_i, tf.int32)
+            dim = tf.cast(shape_t[ax], tf.int64)
+            s_const = tf.constant(int(self.starts[j]), tf.int64)
+            e_const = tf.constant(int(self.ends[j]), tf.int64)
+            st_const = tf.constant(st_i, tf.int64)
 
             s_adj = tf.where(s_const >= 0, s_const, dim + s_const)
             e_adj = tf.where(e_const < 0, dim + e_const, e_const)
