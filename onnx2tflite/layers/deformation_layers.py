@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 import tensorflow as tf
 
 from onnx2tflite.utils.definitions import Layout
@@ -27,37 +28,116 @@ class TFTranspose():
             inputs = tf.transpose(inputs, perm=self.trans_in)
         return tf.transpose(inputs, perm=self.perm_list)
 
+def _slice_int1d_from_weights(node_weights, name: str) -> np.ndarray:
+    if name not in node_weights:
+        raise NotImplementedError(
+            "Slice expects constant initializer tensors for starts/ends/axes/steps "
+            f"(missing '{name}'). Runtime tensor slice bounds are not supported yet."
+        )
+    return np.asarray(node_weights[name], dtype=np.int64).reshape(-1)
+
+
+def _slice_normalize_axes(axes: np.ndarray, rank: int) -> np.ndarray:
+    out = []
+    for a in axes.tolist():
+        ax = int(a)
+        while ax < 0:
+            ax += rank
+        if ax < 0 or ax >= rank:
+            raise ValueError(f"Slice axis {int(a)} out of range for rank {rank}")
+        out.append(ax)
+    return np.asarray(out, dtype=np.int64)
+
+
 @OPERATOR.register_operator("Slice")
 class TFSlice():
+    """
+    ONNX Slice (multi-axis) via tf.strided_slice.
+
+    Fixes vs the old implementation:
+    - Uses full starts/ends/axes/steps vectors (not only index [0]).
+    - Optional axes (3-input Slice) defaults to [0, 1, ..., len(starts)-1] per ONNX.
+    - Resolves negative starts/ends against runtime shape (no static shape[axis] min()).
+    - Multi-axis slicing in one op (matches ONNX).
+    """
+
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, node_outputs, layout_dict, *args, **kwargs) -> None:
         super().__init__()
+        rank = len(tensor_grap[node_inputs[0]].shape)
+
         if len(node_inputs) == 1:
-            self.starts = node_attribute['starts'][0]
-            self.ends = node_attribute['ends'][0]
-            self.axis = node_attribute['axes'][0]
-            self.steps = 1
-        else:
-            self.starts = node_weights[node_inputs[1]][0] if node_inputs[1] in node_weights else tensor_grap[node_inputs[1]][0]
-            self.axis = node_weights[node_inputs[3]][0] if node_inputs[3] in node_weights else tensor_grap[node_inputs[3]][0]
-            self.ends = node_weights[node_inputs[2]][0] if node_inputs[2] in node_weights else tensor_grap[node_inputs[2]][0]
-            self.ends = min(self.ends, tensor_grap[node_inputs[0]].shape[self.axis])
-            if len(node_inputs) < 5:
-                self.steps = 1
+            self.starts = np.asarray(node_attribute["starts"], dtype=np.int64).reshape(-1)
+            self.ends = np.asarray(node_attribute["ends"], dtype=np.int64).reshape(-1)
+            if "axes" in node_attribute and node_attribute["axes"] is not None:
+                ax_arr = np.asarray(node_attribute["axes"], dtype=np.int64).reshape(-1)
+                self.axes = ax_arr if ax_arr.size > 0 else np.arange(len(self.starts), dtype=np.int64)
             else:
-                self.steps = node_weights[node_inputs[4]][0] if node_inputs[4] in node_weights else tensor_grap[node_inputs[4]][0]
-        
-        shape = tensor_grap[node_inputs[0]].shape.as_list()
-        if self.starts < 0:
-            self.starts = shape[self.axis] + self.starts
-        if self.ends < 0:
-            self.ends = shape[self.axis] + self.ends
+                self.axes = np.arange(len(self.starts), dtype=np.int64)
+            if "steps" in node_attribute and node_attribute["steps"] is not None:
+                self.steps = np.asarray(node_attribute["steps"], dtype=np.int64).reshape(-1)
+            else:
+                self.steps = np.ones(len(self.starts), dtype=np.int64)
+        else:
+            self.starts = _slice_int1d_from_weights(node_weights, node_inputs[1])
+            self.ends = _slice_int1d_from_weights(node_weights, node_inputs[2])
+            has_axes = len(node_inputs) > 3 and node_inputs[3] != ""
+            has_steps = len(node_inputs) > 4 and node_inputs[4] != ""
+            if has_axes:
+                self.axes = _slice_int1d_from_weights(node_weights, node_inputs[3])
+            else:
+                self.axes = np.arange(len(self.starts), dtype=np.int64)
+            if has_steps:
+                self.steps = _slice_int1d_from_weights(node_weights, node_inputs[4])
+            else:
+                self.steps = np.ones(len(self.starts), dtype=np.int64)
+
+        if not (len(self.starts) == len(self.ends) == len(self.axes) == len(self.steps)):
+            raise ValueError(
+                f"Slice starts/ends/axes/steps length mismatch: "
+                f"{len(self.starts)}, {len(self.ends)}, {len(self.axes)}, {len(self.steps)}"
+            )
+
+        self.axes = _slice_normalize_axes(self.axes, rank)
 
         if layout_dict[node_inputs[0]] == Layout.Channel_Last:
-            self.axis = dimension_utils.channel_to_last_dimension(self.axis)
+            self.axes = np.asarray(
+                [dimension_utils.channel_to_last_dimension(int(a)) for a in self.axes.tolist()],
+                dtype=np.int64,
+            )
+
+        if np.any(self.steps <= 0):
+            raise NotImplementedError("Slice with step <= 0 is not supported yet; export with positive steps only.")
 
     def __call__(self, inputs):
-        indices = tf.keras.backend.arange(self.starts, self.ends, step=self.steps)
-        return tf.gather(inputs, indices, axis=self.axis)
+        rank = inputs.shape.rank
+        shape_t = tf.shape(inputs)
+        begin_vals = [tf.constant(0, tf.int32) for _ in range(rank)]
+        end_vals = [tf.cast(shape_t[i], tf.int32) for i in range(rank)]
+        stride_vals = [tf.constant(1, tf.int32) for _ in range(rank)]
+
+        for j, ax in enumerate(self.axes.tolist()):
+            ax = int(ax)
+            st_i = int(self.steps[j])
+            dim = tf.cast(shape_t[ax], tf.int32)
+            s_const = tf.constant(int(self.starts[j]), tf.int32)
+            e_const = tf.constant(int(self.ends[j]), tf.int32)
+            st_const = tf.constant(st_i, tf.int32)
+
+            s_adj = tf.where(s_const >= 0, s_const, dim + s_const)
+            e_adj = tf.where(e_const < 0, dim + e_const, e_const)
+            e_adj = tf.minimum(tf.maximum(e_adj, 0), dim)
+            s_adj = tf.minimum(tf.maximum(s_adj, 0), dim)
+            if st_i > 0:
+                e_adj = tf.maximum(e_adj, s_adj)
+
+            begin_vals[ax] = s_adj
+            end_vals[ax] = e_adj
+            stride_vals[ax] = st_const
+
+        begin = tf.stack(begin_vals)
+        end = tf.stack(end_vals)
+        strides = tf.stack(stride_vals)
+        return tf.strided_slice(inputs, begin, end, strides)
 
 @OPERATOR.register_operator("Gather")
 class TFGather():

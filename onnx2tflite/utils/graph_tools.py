@@ -3,6 +3,19 @@ import tensorflow as tf
 from tensorflow import keras
 from .definitions import *
 
+
+def _onnx_dim_to_keras(dim) -> int or None:
+    """
+    Map an ONNX tensor shape dimension to a Keras input size.
+
+    Unset protobuf fields report dim_value==0 with HasField('dim_value')==False; using raw
+    dim_value turns symbolic/unknown axes into literal 0 and breaks ops (e.g. Mul broadcast).
+    """
+    if dim.HasField("dim_value") and dim.dim_value > 0:
+        return int(dim.dim_value)
+    return None
+
+
 # copy from https://github.com/gmalivenko/onnx2keras
 def decode_node_attribute(node)->dict:
     """
@@ -35,12 +48,12 @@ def decode_node_attribute(node)->dict:
 def build_tf_inputs(model_graph, layout_dict:dict):
     inputs_name = []
     for inp in model_graph.input:
-        input_shape = [x.dim_value for x in inp.type.tensor_type.shape.dim]
-        if input_shape == []:
+        dims = list(inp.type.tensor_type.shape.dim)
+        if len(dims) == 0:
             continue
         inputs_name.append(inp.name)
         layout_dict[inp.name] = Layout.Default
-        if len(input_shape) < 3:
+        if len(dims) < 3:
             layout_dict[inp.name] = Layout.Channel_None
 
     _inputs_name = inputs_name.copy()
@@ -61,11 +74,11 @@ def build_tf_inputs(model_graph, layout_dict:dict):
     
     input_nodes = {}
     for inp in model_graph.input:
-        input_shape = [x.dim_value for x in inp.type.tensor_type.shape.dim]
-        if input_shape == []:
+        keras_dims = [_onnx_dim_to_keras(x) for x in inp.type.tensor_type.shape.dim]
+        if len(keras_dims) == 0:
             continue
-        batch_size = 1 if input_shape[0] <= 0 else input_shape[0]
-        input_shape = input_shape[1:]
+        batch_size = 1 if keras_dims[0] is None else keras_dims[0]
+        input_shape = keras_dims[1:]
         if layout_dict[inp.name] == Layout.Channel_Last:
             input_shape = input_shape[1:] + input_shape[0:1]
         
