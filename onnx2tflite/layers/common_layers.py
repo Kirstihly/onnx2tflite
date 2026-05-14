@@ -263,21 +263,25 @@ class TFGemm():
     def __init__(self, tensor_grap, node_weights, node_inputs, node_attribute, node_outputs, layout_dict, *args, **kwargs) -> None:
         super().__init__()
         if len(node_inputs) > 2:
-            weights = [node_weights[node_inputs[1]].T, node_weights[node_inputs[2]]]
+            self.kernel = node_weights[node_inputs[1]].T
+            self.bias = node_weights[node_inputs[2]]
         else:
-            weights = [node_weights[node_inputs[1]].T]
+            self.kernel = node_weights[node_inputs[1]].T
+            self.bias = None
 
-        self.dense = keras.layers.Dense(weights[0].shape[1],
-                                        weights=weights,
-                                        use_bias=len(weights)==2)
-        
         self.channel_last = layout_dict[node_inputs[0]] == Layout.Channel_Last
         layout_dict[node_outputs[0]] = Layout.Channel_Last
 
     def __call__(self, inputs):
         if not self.channel_last:
             inputs = dimension_utils.tensor_NCD_to_NDC_format(inputs)
-        return self.dense(inputs)
+        # Avoid keras.layers.Dense: Keras 3 rejects fully or partially unknown inner dims
+        # (e.g. (None, None) or (1, None)) even when weights fix the feature size.
+        k = tf.constant(self.kernel, dtype=inputs.dtype)
+        out = tf.matmul(inputs, k)
+        if self.bias is not None:
+            out = tf.nn.bias_add(out, tf.constant(self.bias, dtype=inputs.dtype))
+        return out
 
 @OPERATOR.register_operator("Identity")
 class TFIdentity():
